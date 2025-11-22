@@ -8,11 +8,29 @@ from typing import Dict, List, Tuple
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+import os
+from contextlib import contextmanager
+from typing import Any, Callable, Optional, cast
+
+from sqlalchemy.engine import Engine
+from typing import Any
+
+
 # (Opcional) usa tu helper si existe
+# `_get_engine` es una función opcional que debe devolver algo "Engine-like".
+_get_engine: Optional[Callable[[], Any]]
+
 try:
-    from .util_db import get_engine as _get_engine
+    from .util_db import get_engine as _get_engine  # type: ignore[assignment]
 except Exception:
     _get_engine = None
+
+
+# ===========================
+# Config
+# ===========================
+# Umbral de % "DESCONOCIDO" (configurable por env)
+MAX_DESCO_PCT = float(os.getenv("MAX_DESCO_PCT", "5.0"))  # 5% por defecto
 
 
 # ---------------------------
@@ -21,8 +39,8 @@ except Exception:
 
 def _is_airflow() -> bool:
     """Detecta si corre dentro de un task de Airflow."""
-    # Airflow setea estas env vars para cada task
     return bool(os.getenv("AIRFLOW_CTX_DAG_ID"))
+
 
 def _maybe_local_db_url(url: str) -> str:
     """
@@ -35,7 +53,8 @@ def _maybe_local_db_url(url: str) -> str:
         return url.replace("warehouse:5432", "localhost:5434")
     return url
 
-def _build_engine() -> Engine:
+
+def _build_engine() -> Any:
     """
     Obtiene un Engine de SQLAlchemy.
     - Si existe util_db.get_engine() lo usa (ideal dentro del contenedor).
@@ -45,13 +64,15 @@ def _build_engine() -> Engine:
         return _get_engine()
 
     from sqlalchemy import create_engine
+
     url = os.getenv("DB_URL", "")
     url = _maybe_local_db_url(url)
     if not url:
         raise RuntimeError("DB_URL no está definido en el entorno.")
-    return create_engine(url, future=True)
 
+    return create_engine(url, future=True)
 @contextmanager
+
 def connect():
     eng = _build_engine()
     with eng.begin() as conn:
@@ -72,6 +93,7 @@ def _collect(conn) -> Tuple[List[str], Dict[str, int]]:
       - metrics:  dict con métricas para logging/XCom
     """
     problems: List[str] = []
+    warns: List[str] = []     # avisos no bloqueantes
     m: Dict[str, int] = {}
 
     # 1) existencia y conteos
@@ -196,6 +218,165 @@ def _collect(conn) -> Tuple[List[str], Dict[str, int]]:
     if m["cloro_fuera_0_5"] > 0:
         problems.append("CLORO fuera de 0..5 (deberían haber quedado en NULL para imputar).")
 
+    # 6c) parámetros no negativos (turbidez/conductividad/dureza/alcalinidad)
+    m["valores_negativos"] = _count(conn, """
+        SELECT COUNT(*) FROM clean_calidad
+        WHERE valor < 0
+          AND (
+            parametro ILIKE '%TURBIDEZ%' OR
+            parametro ILIKE '%CONDUCT%'  OR
+            parametro ILIKE '%DUREZA%'   OR
+            parametro ILIKE '%ALCALIN%'
+          );
+    """)
+    print(f"[CHK] valores negativos en parámetros no-negativos: {m['valores_negativos']}")
+    if m["valores_negativos"] > 0:
+        problems.append(f"clean_calidad tiene {m['valores_negativos']} valores negativos en parámetros no-negativos.")
+
+    # 7) Contacto (avisos blandos)
+    m["emails_malos"] = _count(conn, r"""
+        SELECT COUNT(*) FROM clean_staging
+        WHERE email IS NOT NULL AND email !~* '^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$';
+    """)
+    print(f"[CHK] emails con formato inválido: {m['emails_malos']}")
+    if m["emails_malos"] > 0:
+        warns.append(f"{m['emails_malos']} emails con formato inválido (ej. 'a@b.c').")
+
+    m["telefonos_malos"] = _count(conn, r"""
+        SELECT COUNT(*) FROM clean_staging
+        WHERE telefono IS NOT NULL
+          AND REGEXP_REPLACE(telefono, '[^0-9+]', '', 'g') !~ '^\+?[0-9]{7,15}$';
+    """)
+    print(f"[CHK] teléfonos con formato inválido: {m['telefonos_malos']}")
+    if m["telefonos_malos"] > 0:
+        warns.append(f"{m['telefonos_malos']} teléfonos con posible formato inválido (esperado 7–15 dígitos, opcional '+').")
+
+    # 3c) servicio dentro del catálogo permitido (SOLO para servicios relevantes agua/aseo)
+    m["serv_fuera_catalogo"] = _count(conn, """
+        WITH relevantes AS (
+          SELECT servicio
+          FROM clean_staging
+          WHERE servicio ILIKE ANY (ARRAY[
+            '%ACUED%',      -- acueducto
+            '%ALCANT%',     -- alcantarillado
+            '%ASEO%', '%RESIDU%', '%BASUR%', -- aseo / residuos
+            '%AGUA%'        -- agua potable / variaciones
+          ])
+        )
+        SELECT COUNT(*) FROM relevantes
+        WHERE servicio NOT IN ('ACUEDUCTO','ALCANTARILLADO','ASEO','DESCONOCIDO');
+    """)
+    print(f"[CHK] servicio fuera de catálogo (solo relevantes agua/aseo): {m['serv_fuera_catalogo']}")
+    if m["serv_fuera_catalogo"] > 0:
+        problems.append(f"clean_staging tiene {m['serv_fuera_catalogo']} filas con servicio fuera de catálogo (en los relevantes de agua/aseo).")
+
+    # 3d) porcentaje de 'DESCONOCIDO' en claves (aviso si supera umbral)
+    row = conn.execute(text("""
+        WITH t AS (
+          SELECT COUNT(*) AS n,
+                 SUM((departamento='DESCONOCIDO')::int) AS dep,
+                 SUM((municipio   ='DESCONOCIDO')::int) AS mun,
+                 SUM((servicio    ='DESCONOCIDO')::int) AS srv
+          FROM clean_staging
+        )
+        SELECT
+          CASE WHEN n=0 THEN 0 ELSE 100.0*dep/n END AS pct_dep,
+          CASE WHEN n=0 THEN 0 ELSE 100.0*mun/n END AS pct_mun,
+          CASE WHEN n=0 THEN 0 ELSE 100.0*srv/n END AS pct_srv
+        FROM t;
+    """)).one()
+    pct_dep, pct_mun, pct_srv = float(row[0]), float(row[1]), float(row[2])
+    print(f"[INFO] DESCONOCIDO% dep={pct_dep:.2f} mun={pct_mun:.2f} serv={pct_srv:.2f}")
+    if any(p > MAX_DESCO_PCT for p in (pct_dep, pct_mun, pct_srv)):
+        warns.append(f"Porcentaje de 'DESCONOCIDO' alto: dep={pct_dep:.2f}%, mun={pct_mun:.2f}%, serv={pct_srv:.2f}% (umbral {MAX_DESCO_PCT}%).")
+
+    # 8) Dimensiones: existencia y filas
+    try:
+        m["rows_dim_calidad_geo"]    = _count(conn, "SELECT COUNT(*) FROM dim_calidad_geo;")
+        m["rows_dim_prestacion_geo"] = _count(conn, "SELECT COUNT(*) FROM dim_prestacion_geo;")
+        m["rows_dim_prestadores"]    = _count(conn, "SELECT COUNT(*) FROM dim_prestadores;")
+        print(f"[OK] dim_calidad_geo filas: {m['rows_dim_calidad_geo']}")
+        print(f"[OK] dim_prestacion_geo filas: {m['rows_dim_prestacion_geo']}")
+        print(f"[OK] dim_prestadores filas: {m['rows_dim_prestadores']}")
+    except Exception as e:
+        problems.append(f"Una dimensión no existe o falló la lectura: {e}")
+        # retornamos ya; las demás validaciones de dims dependen de su existencia
+        for w in warns:
+            print(f"[WARN] {w}")
+        m["warn_count"] = len(warns)
+        return problems, m
+
+    # 8a) PKs únicas
+    m["dups_dim_calidad_geo"] = _count(conn, """
+        SELECT COUNT(*) FROM (
+          SELECT departamento, municipio, COUNT(*) c
+          FROM dim_calidad_geo
+          GROUP BY 1,2 HAVING COUNT(*)>1
+        ) t;
+    """)
+    print(f"[CHK] dups PK dim_calidad_geo: {m['dups_dim_calidad_geo']}")
+    if m["dups_dim_calidad_geo"] > 0:
+        problems.append(f"dim_calidad_geo tiene {m['dups_dim_calidad_geo']} duplicados en (departamento, municipio).")
+
+    m["dups_dim_prestacion_geo"] = _count(conn, """
+        SELECT COUNT(*) FROM (
+          SELECT departamento, municipio, COUNT(*) c
+          FROM dim_prestacion_geo
+          GROUP BY 1,2 HAVING COUNT(*)>1
+        ) t;
+    """)
+    print(f"[CHK] dups PK dim_prestacion_geo: {m['dups_dim_prestacion_geo']}")
+    if m["dups_dim_prestacion_geo"] > 0:
+        problems.append(f"dim_prestacion_geo tiene {m['dups_dim_prestacion_geo']} duplicados en (departamento, municipio).")
+
+    m["dups_dim_prestadores"] = _count(conn, """
+        SELECT COUNT(*) FROM (
+          SELECT departamento, municipio, provider_id, COUNT(*) c
+          FROM dim_prestadores
+          GROUP BY 1,2,3 HAVING COUNT(*)>1
+        ) t;
+    """)
+    print(f"[CHK] dups PK dim_prestadores: {m['dups_dim_prestadores']}")
+    if m["dups_dim_prestadores"] > 0:
+        problems.append(f"dim_prestadores tiene {m['dups_dim_prestadores']} duplicados en (departamento, municipio, provider_id).")
+
+    # 8b) No nulos en llaves de dimensiones
+    m["nulls_dim_calidad_geo"] = _count(conn, """
+        SELECT COUNT(*) FROM dim_calidad_geo
+        WHERE departamento IS NULL OR municipio IS NULL;
+    """)
+    m["nulls_dim_prestacion_geo"] = _count(conn, """
+        SELECT COUNT(*) FROM dim_prestacion_geo
+        WHERE departamento IS NULL OR municipio IS NULL;
+    """)
+    m["nulls_dim_prestadores"] = _count(conn, """
+        SELECT COUNT(*) FROM dim_prestadores
+        WHERE departamento IS NULL OR municipio IS NULL OR provider_id IS NULL;
+    """)
+    print(f"[CHK] nulos claves dim_calidad_geo: {m['nulls_dim_calidad_geo']}")
+    print(f"[CHK] nulos claves dim_prestacion_geo: {m['nulls_dim_prestacion_geo']}")
+    print(f"[CHK] nulos claves dim_prestadores: {m['nulls_dim_prestadores']}")
+    if m["nulls_dim_calidad_geo"] > 0: problems.append("dim_calidad_geo tiene nulos en llaves.")
+    if m["nulls_dim_prestacion_geo"] > 0: problems.append("dim_prestacion_geo tiene nulos en llaves.")
+    if m["nulls_dim_prestadores"] > 0: problems.append("dim_prestadores tiene nulos en llaves.")
+
+    # 8c) Referencial suave: dim_prestadores ⊆ clean_staging
+    m["prestadores_sin_clean"] = _count(conn, """
+        SELECT COUNT(*) FROM dim_prestadores d
+        LEFT JOIN clean_staging c
+          ON c.provider_id=d.provider_id
+         AND c.departamento=d.departamento
+         AND c.municipio=d.municipio
+        WHERE c.provider_id IS NULL;
+    """)
+    print(f"[CHK] prestadores sin match en clean_staging: {m['prestadores_sin_clean']}")
+    if m["prestadores_sin_clean"] > 0:
+        warns.append(f"{m['prestadores_sin_clean']} registros en dim_prestadores no encontraron match exacto en clean_staging (posible normalización distinta).")
+
+    # --- imprimir avisos no bloqueantes ---
+    for w in warns:
+        print(f"[WARN] {w}")
+    m["warn_count"] = len(warns)
     return problems, m
 
 
@@ -228,8 +409,7 @@ def run(**kwargs):
     if problems:
         _fail(problems)
 
-    print("\n✅ [DQ QUICKCHECK] OK — datos básicos consistentes.\n")
-    # Lo que retorna el callable se guarda en XCom (Airflow 2.x)
+    print("\n✅ [DQ QUICKCHECK] OK — datos básicos y dimensiones consistentes.\n")
     return {"status": "ok", **metrics}
 
 def main():
@@ -244,7 +424,7 @@ def main():
     if problems:
         _fail(problems)
 
-    print("\n✅ [DQ QUICKCHECK] OK — datos básicos consistentes.\n")
+    print("\n✅ [DQ QUICKCHECK] OK — datos básicos y dimensiones consistentes.\n")
     sys.exit(0)
 
 if __name__ == "__main__":
